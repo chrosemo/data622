@@ -1,0 +1,405 @@
+---
+title: Using logistic regression to predict species of penguin
+author: "C. Rosemond"
+date: "February 19, 2021"
+output:
+    pdf_document:
+      latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment = NA)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(palmerpenguins)
+library(tidyverse)
+library(skimr)
+library(GGally)
+library(corrplot)
+library(e1071)
+library(caret)
+library(stats)
+library(workflows)
+library(recipes)
+library(parsnip)
+library(rsample)
+library(tune)
+library(yardstick)
+library(nnet)
+```
+
+
+## 1. Logistic regression with a binary outcome (40)
+
+```{r, message=FALSE, warning=FALSE}
+penguins <- penguins
+```
+
+The goal of this analysis is to build a binary logistic regression model that predicts the species of penguin given some combination of seven initial features. The full data set contains 344 records, each one representing a penguin observed on three islands in the Palmer Archipelago, Antarctica. Each record has a response `species`, which consists of three different species of penguin. The seven possible model features describe various characteristics of the observed penguins. They range from island where observed (`island`) to length of bill in millimeters (`bill_length_mm`) to body mass in grams (`body_mass_g`). There is a `year` feature, but there is zero indication that the records are panel data describing the same penguins over time.
+
+```{r, message=FALSE, warning=FALSE}
+skim(penguins) %>%
+  dplyr::select(-n_missing, -numeric.p25, -numeric.p75, -numeric.hist)
+```
+
+The `species` response consists of three categories: Adelie, with 152 observations; Gentoo, with 124 observations; and Chinstrap, with 68 observations. Zero observations have a missing response.
+
+Personal domain expertise with other wildlife suggests that `island`, or geographic location, could share a close relationship with `species`. A cross-tabulation reveals that Chinstrap and Gentoo penguins are solely found on Dream and Biscoe islands, respectively, while solely Adelie penguins are found on Torgersen island. This pattern is identified as statistically significant ($\alpha$ = 0.05) by a Pearson's Chi-squared test ($\chi^2$ = 299.55 on 4 degrees of freedom, $p$-value ~ 0). The same test applied to combinations of `species` and each of `sex` and `year` returns results that are not statistically significant ($\alpha$ = 0.05).
+
+```{r}
+table(penguins$species, penguins$island)
+chisq.test(table(penguins$species, penguins$island))
+chisq.test(table(penguins$species, penguins$sex))
+chisq.test(table(penguins$species, penguins$year))
+```
+
+This perfect or near-perfect separation between `species` and `island` (or possibly other features) is not a bad thing, practically speaking, but it could pose problems for logistic regression. Regression typically uses maximum-likelihood estimation to estimate model parameters. Considering [near-]separation between values of the response and a feature, the resulting [near-]certainty around the data could prevent convergence to a maximum-likelihood estimate and thus result in unusually high parameter estimates with even higher standard errors. The feature `island` or its dummies may need to be removed from modeling given a response derived from `species`.
+
+A new binary response `adelie` is created from `species`. The ultimate model will predict whether a penguin is an Adelie penguin (`adelie` == "Adelie") or is not an Adelie penguin (`adelie` == "Not Adelie").  One-hundred-fifty-two, or approximately 44.2 percent of observations have a value of "1" for `adelie`. Choosing `adelie`, and collapsing "Gentoo" and "Chinstrap" of `species`, creates relative balance in the binary response, which will facilitate modeling. 
+
+```{r}
+df <- penguins
+df <- df %>%
+  mutate(adelie = fct_rev(as_factor(if_else(species == "Adelie", "Adelie", "Not Adelie")))) %>%
+  mutate(year = as_factor(year)) %>%
+  select(-c(species))
+sum(df$adelie == "Adelie")
+```
+
+Another round of chi-squared tests, this time with `adelie`, is similar in results to the first. The relationship between `adelie` and `island` is statistically significant ($\alpha$ = 0.05) with a p-value of approximately zero.
+
+```{r}
+table(df$adelie, df$island)
+chisq.test(table(df$adelie, df$island))
+chisq.test(table(df$adelie, df$sex))
+chisq.test(table(df$adelie, df$year))
+```
+
+
+Beyond the response, the initial exploratory data analysis reveals several characteristics about the features. First, the data set consists generally of complete observations, and all features are complete at rates greater than approximately 0.97. Second, the numeric body characteristic features do not appear to show significant skewness, though they may yet benefit from transformation prior to modeling. And third, `year` is currently numeric but should arguably be categorical in this context; it is converted to a factor. All of the factors will be converted to dummy features, minus one level dummy for each original factor, prior to modeling. 
+
+
+```{r, message=FALSE, warning=FALSE}
+df %>% ggpairs()
+```
+
+Visualizing the distributions of the response and features along with the relationships between them reveals additional information to inform modeling. First, there are clear differences in body characteristics between "Adelie" and "Not Adelie" values of response `adelie`. These features could prove helpful for modeling. Second, considering the factors and building upon the prior chi-square tests, `sex` and `year` appear relatively balanced across levels and values of `adelie`; `island`, again, does not. And third, `flipper_length_mm` and `body_mass_g` share a strong positive relationship that may need to be accounted for prior to modeling. There also appear to be possible gender differences in the body characteristics.
+
+Data pre-processing starts with addressing missingness. Imputing meaning for missing values--meaning where it may not exist--can be problematic, particularly with limited domain expertise. For ease of analysis and in response to the relatively few missing values as well as minimal information available to assess the data set's ignorability, the eleven observations with missing values are dropped, leaving 333 observations in the data set.
+
+```{r}
+df_complete <- na.omit(df)
+dim(df_complete)[1]
+```
+
+
+There may be a need to transform existing features or create new ones in preparation for modeling. This process begins by assessing the numeric body characteristic features for possible power transformation. Below are skewness statistics for each feature, with negative values reflecting left skewness and positive values reflecting right skewness. Larger values are associated with greater levels of skewness. None of the predictors show large skew. For ease of interpretability of model coefficients, they are left not transformed.
+
+```{r, message=FALSE, warning=FALSE}
+knitr::kable(sapply(df_complete[c("bill_length_mm","bill_depth_mm","flipper_length_mm","body_mass_g")], skewness), col.names = c("Skewness"))
+```
+
+
+Regarding multicollinearity, Pearson's correlation coefficient is used to check correlations between the body characteristic features. A plot of the correlations confirms the relative relationships identified earlier, though none of them feature correlations that exceed 0.90--a default used by the `caret` package. At approximately 0.87, the pair of `flipper_length_mm` and `body_mass_g` are close, but they won't be removed from consideration.
+
+```{r, message=FALSE, warning=FALSE}
+corr <- cor(df_complete[,c("bill_length_mm","bill_depth_mm","flipper_length_mm","body_mass_g")], method = "pearson")
+corrplot::corrplot(corr)
+length(hicorr <- findCorrelation(corr))
+```
+
+Lastly, the dataset is split 80/20 into a training set (n = 267) and a test set (n = 66). The latter will be held out for validation of the final model.
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(622)
+df_complete$island <- fct_rev(df_complete$island) #reversed to ensure "Torgersen" held out
+index <- as.vector(createDataPartition(df_complete$adelie, p = .80, list = FALSE))
+train <- df_complete[index,] # 267 observations
+test <- df_complete[-index,] # 66 observations
+```
+
+####
+
+#### Model 1
+
+The first model is simple and regresses response `adelie` on all features in the training set. Factors `island`, `sex`, and `year` are converted to sets of dummies for each level of the original factor. Then, the first level dummy of each set is left out to avoid perfect collinearity between levels of the set.
+
+```{r}
+m1 <- glm(adelie ~ .,
+          data = train,
+          family = binomial)
+summary(m1)
+```
+
+The estimated model coefficients are all relatively high, and their respective estimated standard errors are even higher. The associated z-scores are all approximately zero, leading to very high p-values. The median residual error is also approximately zero.
+
+It is immediately clear that there is an issue with this model. The warning notes that the underlying model algorithm failed to converge on parameter estimates and that at least some of the fitted probabilities were zero or one. The former suggests an instance of the separation and maximum-likelihood estimation issue arising earlier with `adelie` (and `species`) and `islands`. Holding out the `islandTorgersen` dummy, which perfectly predicts `adelie`, made no difference, however.
+
+
+#### Model 2
+
+The process for the second model starts over, focusing on features based upon the EDA. Considering the feature boxplots for levels of `adelie`, body characteristics `bill_length_mm` and  `flipper_length_mm` appear to show clear differences between "Adelie" and "Not Adelie". Notably, for both features, their distributions across the levels of `adelie` overlap minimally, which suggests they could be strong predictors. By comparison, the distributions for the other two body characteristic features show greater overlap. Additionally, excluding `island`, `sex` and `year` are both balanced across "Adelie" and "Not Adelie", so they may not be strong predictors.
+
+The second model regresses `adelie` on `bill_length_mm` and `flipper_length_mm`.
+
+```{r}
+m2 <- glm(adelie ~ bill_length_mm + flipper_length_mm,
+          data = train,
+          family = "binomial")
+summary(m2)
+```
+
+Unlike the first model, the second one converges upon a maximum-likelihood estimate. Its AIC of approximately 73.34 seems okay. All of the model coefficients are statistically significant ($\alpha$ = 0.05) with p-values of approximately zero, and the negative coefficients on `bill_length_mm` and `flipper_length_mm` suggest that those features share negative relationships with `adelie`. The intercept's coefficient and standard error are quite high, but they are not a concern given that encountering a penguin whose `bill_length_mm` and `flipper_length_mm` are zero is impossible.
+
+```{r, message=FALSE, warning=FALSE}
+exp(cbind(coef(m2), confint(m2)))
+```
+
+Looking at the coefficients as odds-ratios eases their interpretation. Per this model, an increase of one mm in `bill_length_mm` is associated with a decrease of roughly 63 percent in the likelihood of being an "Adelie" penguin (`adelie` == "Adelie"). The 95% confidence interval, based on log likelihood, about that odds-ratio estimate ranges from a rough 75 percent decrease in likelihood to a rough 51 percent decrease in likelihood. Similarly, an increase of one mm in `flipper_length_mm` is associated with a decrease of roughly nine percent in the likelihood of being an "Adelie" penguin; its 95% confidence interval ranges from a rough fifteen percent decrease to a rough four percent decrease.
+
+
+```{r}
+with(m2, null.deviance - deviance)
+with(m2, df.null - df.residual)
+with(m2, pchisq(null.deviance - deviance, df.null - df.residual, lower.tail = FALSE))
+```
+
+The chi-square test statistic of approximately 298.71 with 2 degrees of freedom--the number of model predictors--has a p-value of approximately 0, which is statistically significant at $\alpha$ = 0.05. So, the model fits the data better than a null model consisting solely of an intercept.
+
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(622)
+cv_five_fold <- vfold_cv(train, v = 5)
+flow <- workflow() # start a workflow for the entire process
+model_formula <- recipe(adelie ~ bill_length_mm + flipper_length_mm, 
+                  data = train)
+model_type <- logistic_reg() %>% 
+  set_engine("glm")
+flow <- flow %>% 
+  add_recipe(model_formula) %>% 
+  add_model(model_type)
+fits <- fit_resamples(flow,
+                      resamples = cv_five_fold, 
+                      metrics = metric_set(accuracy, sens, spec, pr_auc)) #Cross Validated (2020)
+fits %>% 
+  collect_metrics()
+```
+
+Incorporating five-fold cross-validation of the model using the training set provides additional insights. The model performs well across metrics, with mean accuracy across the five folds of approximately 0.95, mean sensitivity of approximately 0.95, mean specificity of approximately 0.96, and mean area under the ROC curve of approximately 0.99. However, better measures of its actual performance come when predicting on the test set.
+
+
+```{r}
+m2_pred <- predict(m2, newdata = test, type = "response")
+m2_test <- test %>% mutate(adelie_pred = if_else(m2_pred > 0.5, 1, 0), adelie_pred_prob = m2_pred)
+(m2_cf <- table(m2_test$adelie_pred, m2_test$adelie, dnn = c("Predicted","Actual")))
+```
+
+A confusion matrix of the model's predictions on the test set suggests good performance. There are 28 true positives (TP), 37 true negatives (TN), and 1 false negative (FN). There are zero false positives (FP). 
+
+###
+
+## 2. For your model from #1, please provide: AUC, Accuracy, TPR, FPR, TNR, FNR (20)
+
+#### Accuracy
+
+Accuracy = $\frac{TP + TN}{TP + TN + FP + FN}$
+
+```{r, message=FALSE, warning=FALSE}
+(m2_cf[1,1] + m2_cf[2,2])/sum(m2_cf)
+```
+
+The model's accuracy on the test set is approximately 0.98.
+
+
+#### Sensitivity (True Positive Rate)
+
+Sensitivity = $\frac{TP}{TP + FN}$
+
+```{r}
+(sensitivity <- m2_cf[2,2]/(m2_cf[1,2] + m2_cf[2,2]))
+```
+
+The model's sensitivity on the test set is approximately 0.97.
+
+
+#### Specificity (True Negative Rate)
+
+Specificity = $\frac{TN}{TN + FP}$
+
+```{r}
+(specificity <- m2_cf[1,1]/(m2_cf[1,1] + m2_cf[2,1]))
+```
+
+The model's specificity on the test set is approximately one.
+
+
+#### False Positive Rate
+
+False Positive Rate = $\frac{FP}{TN + FP}$
+
+```{r}
+(fpr <- 1 - specificity)
+```
+
+The model's false positive rate--the complement of its specificity--is approximately zero.
+
+
+#### False Negative Rate
+
+False Negative Rate = $\frac{FN}{TP + FN}$
+
+```{r}
+(fnr <- 1 - sensitivity)
+```
+
+The model's false negative rate--the complement of its sensitivity--is approximately 0.03.
+
+
+#### Area under curve (AUC)
+
+```{r, fig.cap="Model ROC curve"}
+m2_auc <- m2_test[order(-m2_test$adelie_pred_prob),]
+no <- ifelse(m2_auc$adelie_pred == 0, 1, 0)
+sensit <- cumsum(m2_auc$adelie_pred)/sum(m2_auc$adelie_pred)
+one_spec <- cumsum(no)/sum(no)
+plot(x = one_spec,
+     y = sensit,
+     main="ROC Curve",
+     xlab="1 - Specificity",
+     ylab="Sensitivity",
+     col="blue")
+(auc <- sum(diff(one_spec) * (head(sensit, -1) + tail(sensit, -1)))/2)
+```
+
+The AUC for the model's ROC curve is approximately one.
+
+In sum, the model predicts the test set near perfectly. This performance seems more than sufficient for a model including only two predictors: features `bill_length_mm` and `flipper_length_mm`. Presumably, incorporating additional features could result in perfect predictive performance, but doing so would come at the cost of some simplicity.
+
+###
+
+## 3. Multinomial Logistic Regression (40)
+
+Construction of a multinomial logistic regression model to predict `species` mirrors the EDA and data pre-processing performed for the binomial logistic regression model.
+
+```{r}
+df_multi <- penguins
+df_multi <- df_multi %>%
+  mutate(year = as_factor(year))
+```
+
+```{r, message=FALSE, warning=FALSE}
+df_multi %>% ggpairs()
+```
+
+Here again, visualizing the distributions of the response and possible features reveals information to inform modeling. First, there are clear differences in body characteristics between values of `species`. Specifically, relative to the other two species, "Gentoo" penguins tend to have lower values for `bill_depth_mm` and higher values for `flipper_length_mm` and `body_mass_g`. Second, "Gentoo" penguins are found solely on "Biscoe" island, while "Chinstrap" penguins are found solely on "Dream" island. The feature `island` could be *too* predictive of `species` to ensure a model's maximum-likelihood estimate will converge. And third, again, each of the species appears well-balanced across the levels of factors `sex` and `year`.
+
+
+```{r}
+df_multi_complete <- na.omit(df_multi)
+dim(df_multi_complete)[1]
+```
+
+After dropping the eleven incomplete observations, and considering the limited skewness and multicollinearity identified earlier, 333 observations are left in the data set. This full set is split 80/20 into training (n = 268) and test sets (n = 65); the latter will be held out.
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(622)
+df_multi_complete$island <- fct_rev(df_complete$island) #reversed to ensure "Torgersen" held out
+multi_index <- as.vector(createDataPartition(df_multi_complete$species, p = .80, list = FALSE))
+multi_train <- df_multi_complete[multi_index,] # 267 observations
+multi_test <- df_multi_complete[-multi_index,] # 66 observations
+```
+
+
+#### Model 1
+
+The first multinomial model regresses response `species` on all available features. Factors `island`, `sex`, and `year` are converted to sets of dummies for each level of the original factor, then the first level dummy of each set is left out.
+
+```{r}
+multi_m1 <- multinom(species ~ .,
+                data = multi_train) #IDRE (2021) - Multinomial Logistic Regression
+summary(multi_m1)
+```
+
+Unlike its binomial regression model that included all available features, this multinomial model converged on a minimal negative-log likelihood estimate. Its coefficients, representing "Chinstrap" and "Gentoo", reference "Adelie". In effect, it combines two binomial comparisons: "Chinstrap" and "Adelie", and "Gentoo" and "Adelie".
+
+However, the coefficients are very high and have very high standard errors, which prompts skepticism. Further, the residual deviance is very low, perhaps too low. The model's AIC is approximately forty.
+
+
+```{r}
+exp(coef(multi_m1))
+```
+
+Exponentiating the logit coefficients reveals a set of unrealistic odds relative to the base level  "Adelie". For example, a one mm increase in `bill_length_mm` is associated with a likelihood for "Chinstrap" that is hundreds of millions of times higher than that of "Adelie", while a one mm increase in `bill_depth_mm` raises the likelihood of "Chinstrap" by essentially zero. Unfortunately, this model is scrapped.
+
+
+#### Model 2
+
+The second multinomial model echoes its binomial counterpart, regressing `species` on `bill_length_mm` and `flipper_length_mm`. These features seems like a reasonable starting point given their previous predictive performance.
+
+```{r}
+multi_m2 <- multinom(species ~ bill_length_mm + flipper_length_mm,
+                data = multi_train)
+summary(multi_m2)
+```
+
+The model converges to an optimal log-likelihood of approximately 31.76. Its AIC is approximately 75.51, and its residual deviance, across all observations, is approximately 63.51. Unlike the initial multinomial model, this one has coefficient estimates that, at first glance, appear reasonable.
+
+```{r}
+exp(coef(multi_m2))
+```
+
+The exponentiated coefficients reveal information about the relationships between species based upon `bill_length_mm` and `flipper_length_mm`. Considering `bill_length_mm`, an increase in bill length of one mm is associated with an approximate 235 percent increase in the likelihood of predicting "Chinstrap" relative to "Adelie", and is associated with an approximate 42 percent increase in the likelihood of predicting "Gentoo" relative to "Adelie". Considering `flipper_length_mm`, an increase in flipper length of one mm is associated with an approximate 12 percent decrease in the likelihood of predicting "Chinstrap" relative to "Adelie", and is associated with an approximate 72 percent increase in the likelihood of predicting "Gentoo" relative to "Adelie".
+
+
+#### Model 3
+
+A third model improves slightly upon the second model. It regresses `species` on `bill_length_mm`, `flipper_length_mm`, and `year`. Per EDA, the last feature appears to show slight differences between `species` levels regarding the balance of observations across years.
+
+```{r}
+multi_m3 <- multinom(species ~ bill_length_mm + flipper_length_mm + year,
+                data = multi_train)
+summary(multi_m3)
+```
+
+The model converges to an optimal log-likelihood of approximately 31.22--slightly lower than the second model's--and its AIC is approximately 82.44--slightly higher than the second's.
+
+```{r}
+exp(coef(multi_m3))
+```
+
+The exponentiated coefficients for `bill_length_mm`, `flipper_length_mm`, and `year` Considering `bill_length_mm`, an increase in bill length of one mm is associated with an approximate 243 percent increase in the likelihood of predicting "Chinstrap" relative to "Adelie". This estimate, after accounting for `year`, represents an increase in absolute value over its second model counterpart. The coefficient on "Gentoo", which indicates that a one mm increase in bill length is associated with an approximate 45 percent increase in likelihood of prediction, exhibits similar behavior compared to the same coefficient in the second model. 
+
+Adding `year` also amplifies the coefficients on `flipper_length_mm`. Here, a one mm increase in flipper length is associated with an approximate 11 percent decrease in the likelihood of predicting "Chinstrap" relative to "Adelie", and is associated with an approximate 80 percent increase in the likelihood of predicting "Gentoo" relative to "Adelie".
+
+Regarding `year` itself, moving from "2007" to "2008" is associated with an approximate 57 percent increase in the likelihood of predicting "Chinstrap" relative to "Adelie" and an approximate 76 percent decrease in the likelihood of predicting "Gentoo" relative to "Adelie". By comparison, moving from "2007" to "2009" is associated with an approximate 9 percent decrease in the likelihood of predicting "Chinstrap" and an approximate 84 percent decrease in the likelihood of predicting "Gentoo".
+
+```{r}
+(z <- coef(multi_m3) / summary(multi_m3)$standard.errors) #IDRE (2021) - Multinomial Logistic Regression
+(p <- (1 - pnorm(abs(z), 0, 1)) * 2)
+```
+
+
+However, calculating z-score test statistics reveals that the coefficients on the `year` dummies are not statistically significant ($\alpha$ = 0.05). Nor are all of the z-scores on `bill_length_mm` and `flipper_length_mm` significant at the same $\alpha$. Statistical significance is not necessarily reliable for decision making, but here it suggests that `year` adds little to the model.
+
+In response, the second model, which performs similarly with one less model parameter, is used for evaluation on the test set.
+
+#### Test Set Prediction
+
+```{r}
+multi_pred <- data.frame(prediction = predict(multi_m2, multi_test), target = multi_test$species)
+sum(multi_pred$prediction == multi_pred$target)/dim(multi_pred)[1]
+```
+
+There are limited options for assessing the multinomial model's predictive performance on the test set. One basic way is to calculate the proportion of observation predictions that match that observation's `species` value. Using the second multinomial model that regresses `species` on `bill_length_mm` and `flipper_length_mm`, approximately 95 percent of predictions matched the associated `species` values. This performance seems okay for the purposes of this exercise.
+
+###
+
+## Sources
+
+Cross Validated (2020).*Help testing the predictive quality of a binomial GLM (currently attempting using the "caret" package)*. Stack Exchange. Accessed February 15, 2021 from https://stats.stackexchange.com/questions/459724/help-testing-the-predictive-quality-of-a-binomial-glm-currently-attempting-usin
+
+Institute for Digital Research & Education Statistical Consulting (2021). *Logit regression | R data analysis examples*. University of California, Los Angeles. Accessed February 14, 2021 from https://stats.idre.ucla.edu/r/dae/logit-regression/
+
+Institute for Digital Research & Education Statistical Consulting (2021). *Multinomial logistic regression | R data analysis examples*. University of California, Los Angeles. Accessed February 14, 2021 from https://stats.idre.ucla.edu/r/dae/multinomial-logistic-regression/
+
